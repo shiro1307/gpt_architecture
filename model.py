@@ -15,75 +15,58 @@ blocks have characters/tokens.
 # C -> embedding dimension
 # V - > vocabulary size
 
-class Head(nn.Module):
-  def __init__(self, C, head_dim):
-    super().__init__()
-
-    self.key = nn.Linear(C,head_dim,bias = False)
-    self.query = nn.Linear(C,head_dim,bias = False)
-    self.value = nn.Linear(C,head_dim,bias = False)
-
-  def forward(self,x):
-    B,T,C = x.shape
-
-    #1. project x into q, k, v
-    k = self.key(x)
-    q = self.query(x)
-    v = self.value(x)
-
-    d_k = q.size(-1) 
-
-    #2. calc attention scores
-    scores = torch.matmul(q, k.transpose(-2, -1))
-
-    #3. scale scores
-    scaled_scores = scores / math.sqrt(d_k)
-
-    #4. apply casual mask
-    mask = torch.tril(torch.ones(T, T, device=x.device))
-    scaled_scores = scaled_scores.masked_fill(mask == 0, float('-inf'))
-    
-    #5. apply softmax
-    attention_weights = F.softmax(scaled_scores, dim=-1) 
-
-    #6. combine attention weights with values
-    output = torch.matmul(attention_weights, v) 
-
-    return output
-
 class MultiHeadAttention(nn.Module):
-    def __init__(self, C, num_heads, block_size):
+    def __init__(self, C, num_heads, block_size, dropout):
         super().__init__()
 
-        head_dim = C // num_heads
-
-        #holds neural modules in a trackable list
-        self.heads = nn.ModuleList()
-        
         assert C % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = C // num_heads
 
-        #create multiple Head instances
-        for n in range(num_heads):
-          head = Head(C,head_dim)
-          self.heads.append(head)
+        # single fused projection for q, k, v across all heads at once
+        self.qkv = nn.Linear(C, 3 * C, bias=False)
 
-        #create final linear projection
-        self.proj = nn.Linear(C,C)
+        self.proj = nn.Linear(C, C)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+
+        self.register_buffer(
+            "tril",
+            torch.tril(torch.ones(block_size, block_size))
+        )
 
     def forward(self, x):
-        #run every head on x
-        head_outputs = [head(x) for head in self.heads]
+        B, T, C = x.shape
 
-        #concatenate outputs along last dimension
-        out = torch.cat(head_outputs, dim=-1)
+        # compute q, k, v for all heads in one matmul
+        q, k, v = self.qkv(x).split(C, dim=2)  # each: (B, T, C)
 
-        #apply final projection
-        out = self.proj(out)
+        # reshape to (B, num_heads, T, head_dim)
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # attention scores: (B, num_heads, T, T)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # causal mask
+        scores = scores.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+
+        # softmax + dropout
+        weights = F.softmax(scores, dim=-1)
+        weights = self.attn_dropout(weights)
+
+        # combine: (B, num_heads, T, head_dim) -> (B, T, C)
+        out = torch.matmul(weights, v)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+
+        # output projection
+        out = self.resid_dropout(self.proj(out))
 
         return out
 
 class FeedForward(nn.Module):
-  def __init__(self,C):
+  def __init__(self,C, dropout):
     super().__init__()
 
     #expand c -> 4c
@@ -97,20 +80,23 @@ class FeedForward(nn.Module):
     #project 4c -> c
     self.fc2 = nn.Linear(4*C,C)
 
+    self.dropout = nn.Dropout(dropout)
+
   def forward(self,x):
     #pass x thru layers
     x = self.fc1(x)
     x = self.activation(x)
-    out = self.fc2(x)
-    return out
+    x = self.fc2(x)
+    x = self.dropout(x)
+    return x
 
 class Block(nn.Module):
-  def __init__(self, C, num_heads, block_size):
+  def __init__(self, C, num_heads, block_size, dropout):
     super().__init__()
     self.ln1 = nn.LayerNorm(C)
     self.ln2 = nn.LayerNorm(C)
-    self.attention = MultiHeadAttention(C, num_heads, block_size)
-    self.feed_forward = FeedForward(C)
+    self.attention = MultiHeadAttention(C, num_heads, block_size, dropout)
+    self.feed_forward = FeedForward(C, dropout)
 
     #store the components here
 
@@ -126,8 +112,10 @@ class Block(nn.Module):
     return x
 
 class GPTLanguageModel(nn.Module):
-  def __init__(self,vocab_size, C,num_heads,block_size, num_blocks):
+  def __init__(self,vocab_size, C,num_heads,block_size, num_blocks, dropout=0.2):
     super().__init__()
+
+    self.block_size = block_size
 
     #converts each token id into a vector of size C
     self.embed = nn.Embedding(vocab_size, C)
@@ -135,10 +123,14 @@ class GPTLanguageModel(nn.Module):
     #positional embedding
     self.pembed = nn.Embedding(block_size, C)
 
+    self.embedding_dropout = nn.Dropout(dropout)
+
     #transformer blocks
     self.blocks = nn.Sequential()
     for n in range(num_blocks):
-      block = Block(C, num_heads, block_size)
+
+      block = Block(C, num_heads, block_size, dropout)
+
       self.blocks.append(block)
     
     #final layernorm
@@ -146,6 +138,10 @@ class GPTLanguageModel(nn.Module):
 
     #language model head
     self.head = nn.Linear(C, vocab_size)
+
+    # weight tying: share embedding and output projection weights
+    # reduces parameters and improves generalization
+    self.head.weight = self.embed.weight
     
   def forward(self, idx):
     B,T = idx.shape 
@@ -159,6 +155,7 @@ class GPTLanguageModel(nn.Module):
 
     #add them together
     total_embed = token_embed + pos_embed
+    total_embed = self.embedding_dropout(total_embed)
 
     #pass through transformer blocks
     transf_out = self.blocks(total_embed)
@@ -175,7 +172,7 @@ class GPTLanguageModel(nn.Module):
   def generate(self, idx, max_new_tokens, temperature = 0.8):
     for _ in range(max_new_tokens):
         # Keep only the most recent block_size tokens
-        idx_cond = idx[:, -self.pembed.num_embeddings:]
+        idx_cond = idx[:, -self.block_size:]
 
         #Predict the next character
         logits = self(idx_cond)

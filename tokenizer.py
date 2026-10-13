@@ -3,11 +3,8 @@ import torch
 with open("input.txt", "r", encoding="utf-8") as f:
     text = f.read()
 
-print(len(text))
-
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
-print(vocab_size)
 
 stoi = {ch:i for i,ch in enumerate(chars)}
 itos = {i:ch for ch,i in stoi.items()}
@@ -58,5 +55,11 @@ def get_batch(data, batch_size, block_size):
 
 import pickle
 
-with open("tokenizer.pkl", "wb") as f:
-    pickle.dump({"stoi": stoi, "itos": itos}, f)
+if __name__ == "__main__":
+    print(f"Dataset size: {len(text)} chars")
+    print(f"Vocab size: {vocab_size}")
+
+    with open("tokenizer.pkl", "wb") as f:
+        pickle.dump({"stoi": stoi, "itos": itos}, f)
+
+    print("tokenizer.pkl saved")
